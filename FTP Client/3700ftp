@@ -5,9 +5,6 @@ from urllib.parse import urlparse
 import socket
 import os
 
-# Credentials to FTP server
-# Username: lovema
-# Password: HjTSJ8KyEgkLGCBxulp7
 # Ex Cmd: ./3700ftp.py ls ftp://lovema:HjTSJ8KyEgkLGCBxulp7@ftp.3700.network
 
 # Global sockets -- control and data channels
