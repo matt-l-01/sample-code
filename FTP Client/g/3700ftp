@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+
+import argparse
+from urllib.parse import urlparse
+import socket
+import os
+
+# Credentials to FTP server
+# Username: lovema
+# Password: HjTSJ8KyEgkLGCBxulp7
+# Ex Cmd: ./3700ftp.py ls ftp://lovema:HjTSJ8KyEgkLGCBxulp7@ftp.3700.network
+
+# Global sockets -- control and data channels
+global control
+control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+global data
+data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+global BUFFER_SIZE
+BUFFER_SIZE = 1024
+
+# Parses the command-line arguments for the program
+def parseArgs():
+    parseArgs = argparse.ArgumentParser(description='A basic FTP Client for listing, copying, moving, and deleteing files/directories on a remote FTP server')
+    parseArgs.add_argument('operation', help='The operation to conduct. Either ls, mkdir, rm, rmdir, cp, or mv')
+    parseArgs.add_argument('params', nargs='+', help='Parameters for the operation (maximum of 2, minimum of 1). Used for specifying paths.')
+    args = parseArgs.parse_args()
+    # Prevents going over 2 additional parameters
+    if len(args.params) > 2:
+        parseArgs.error('Too many parameters provided. Provide either 1 or 2.')
+    return args
+
+# Checks if the response message begins in a 4/5/6 (error), and quits if so, otherwise returns the message
+def errChk(s: str):
+    num = s[0:1]
+    if num == "4" or num == "5" or num == "6":
+        print(s)
+        print("ERROR...QUITTING...")
+        quitFtp()
+    else:
+        return s
+
+# Receives data from the server. Argument rcvData=True for data channel, default/false for control channel
+def rcv(rcvData=False):
+    rslt = ''
+
+    while True:
+        if rcvData:
+            curr = data.recv(BUFFER_SIZE)
+        else:
+            curr = control.recv(BUFFER_SIZE)
+
+        if not curr: # Skips past any empty data
+            break
+
+        # Decodes and appends the data
+        curr = curr.decode('utf-8')
+        rslt += curr
+
+        # If rslt contains a newline, meaning we are done, break
+        if rslt.endswith('\r\n'):
+            break
+
+    # Remove the newline and spaces from the end and front of the message
+    rslt = rslt.rstrip('\n')
+    rslt = rslt.strip()
+    
+    # If the data received is a message from control channel, check for error
+    if not rcvData:
+        return errChk(rslt)
+    else:
+        return rslt
+
+# Opens the data channel for the FTP server
+def openData():
+    # Initiates PASV command for data channel to open
+    pasvCMD = 'PASV\r\n'
+    control.sendall(pasvCMD.encode('utf-8')) 
+    msg = rcv()
+    print(msg)
+
+    # Obtains the IP/port within the parenthesis
+    msg = msg[msg.index('(') + 1:msg.index(')')]
+    lst = msg.split(',') # Splits on the comma to obtain each number
+
+    ip = lst[0] + '.' + lst[1] + '.' + lst[2] + '.' + lst[3] # Constructs the IP
+    port = (int(lst[4]) << 8) + int(lst[5]) # Calculates the port number by bit-shifting
+
+    data.settimeout(5) # Sets a 5 second time out
+    try:
+        data.connect((ip, port))
+    except:
+        print("Could not connect to data channel...exiting")
+        exit()
+    print('Connected to data channel on', ip, ':', port)
+
+# Logs into the FTP server using the username and password, and sets the proper configurations
+def login(user: str, passwd: str):
+    print(rcv()) # Prints hello message from server
+    unameCMD = 'USER ' + user + '\r\n'
+    control.sendall(unameCMD.encode('utf-8'))
+    print(rcv())
+    
+    if passwd is not None:
+        passCMD = 'PASS ' + passwd + '\r\n'
+        control.sendall(passCMD.encode('utf-8')) 
+        print(rcv())
+
+    # Sets connection to 8-bit binary data mode
+    typeCMD = 'TYPE I\r\n'
+    control.sendall(typeCMD.encode('utf-8')) 
+    print(rcv())
+
+    # Sets connection to stream mode
+    modeCMD = 'MODE S\r\n'
+    control.sendall(modeCMD.encode('utf-8'))
+    print(rcv())
+
+    # Sets connection to file-oriented mode
+    struCMD = 'STRU F\r\n'
+    control.sendall(struCMD.encode('utf-8')) 
+    print(rcv())
+
+# Connects to the control channel using the given arguments
+def connect(host: str, port: int, user: str, passwd: str):
+    if port is None: # Handles the default port for FTP
+        port = 21
+    if user is None: # Handles default user feature
+        user = 'anonymous'
+
+    control.settimeout(5) # Sets a 5 second timer
+
+    # Attempts to connect to the server
+    try:
+        control.connect((host, port))
+    except:
+        print('Could not connect...exiting!')
+        exit()
+    print('Connected!')
+    login(user, passwd)
+
+# Handles the startup of the program: collecting arguments and URL, connecting
+def start(args: argparse, url: urlparse):
+    if url.netloc is None:
+        print('Network location not provided...error')
+        exit()
+
+    connect(url.hostname, url.port, url.username, url.password)
+
+# Quits the FTP server and closes the control channel
+def quitFtp():
+    quitCMD = 'QUIT\r\n'
+    control.sendall(quitCMD.encode('utf-8'))
+    print(rcv())
+    control.close()
+    quit()
+
+# Executes the command given the string of the command
+def executeCmd(cmd: str, url: urlparse, local: str, upload: bool):
+    if cmd == "ls": # Lists the directory given
+        openData() # Opens the data channel
+        
+        listCMD = 'LIST ' + url.path + '\r\n' # Constructs the list command with path, encodes, and sends
+        control.sendall(listCMD.encode('utf-8'))
+
+        print(rcv()) # Prints the received info from control channel
+        print(rcv()) # Second message
+        print(rcv(rcvData=True)) # Prints the received info from data channel
+        return
+
+    elif cmd == "mkdir": # Creates the given directory
+        mkdirCMD = 'MKD ' + url.path + '\r\n'
+        control.sendall(mkdirCMD.encode('utf-8'))
+
+        print(rcv()) # Prints control response
+        return
+
+    elif cmd == "rm":
+        delCMD = 'DELE ' + url.path + '\r\n'
+        control.sendall(delCMD.encode('utf-8'))
+
+        print(rcv()) # Prints control response
+        return
+
+    elif cmd == "rmdir": # Removes the given directory
+        rmdirCMD = 'RMD ' + url.path + '\r\n'
+        control.sendall(rmdirCMD.encode('utf-8'))
+
+        print(rcv()) # Prints control response
+        return
+
+    elif cmd == "cp":
+        openData() # Opens the data channel
+
+        if upload:
+            cpCMD = 'STOR ' + url.path + '\r\n'
+            control.sendall(cpCMD.encode('utf-8'))
+            print(rcv()) # Prints control response
+
+            with open(local, "rb") as f: # Opens and uploads the file in BUFFER_SIZE bytes
+                while True:
+                    readBytes = f.read(BUFFER_SIZE)
+
+                    if not readBytes: # Finished sending data?
+                        break
+
+                    data.sendall(readBytes)
+            
+            data.close() # Closes data channel when done as we are the sender
+        else: # Downloading
+            cpCMD = 'RETR ' + url.path + '\r\n'
+            control.sendall(cpCMD.encode('utf-8'))
+            print(rcv()) # Prints control response
+
+            with open(local, "wb") as f: # Downloads the file in sizes of BUFFER_SIZE bytes, and writes to a file
+                while True:
+                    readBytes = data.recv(BUFFER_SIZE)
+
+                    if not readBytes: # Finished reading data?
+                        break
+
+                    f.write(readBytes)
+
+        return
+    elif cmd == "mv": # Utilizes already implemented commands to implement
+        if upload:
+            executeCmd('cp', url, local, upload)
+            os.remove(local) # Removes the file locally after uploading it
+        else:
+            executeCmd('cp', url, local, upload)
+            executeCmd('rm', url, local, upload) # Removes the file on the server after downloading it
+        return
+
+def main():
+    args = parseArgs() # Parse arguments
+
+    # If we only have one parameter, meaning no upload/downloading
+    if len(args.params) == 1:
+        url = urlparse(args.params[0], scheme='ftp')
+        localPath = None # Must initialize to prevent errors
+        upload = None
+    else: # Multiple arguments --> uploading or downloading a file
+        # Checks if the ftp URL is first or second. First -> download, second -> upload
+        if args.params[0][0:3] == 'ftp':
+            url = urlparse(args.params[0], scheme='ftp')
+            localPath = args.params[1]
+            upload = False # Determines upload or download if applicable (false = download)
+        else:
+            url = urlparse(args.params[1], scheme='ftp')
+            localPath = args.params[0]
+            upload = True # Determines upload or download if applicable (true = upload)
+            
+    # Starts the program...opens the control channel and sets correct setting
+    start(args, url)
+
+    # Executes the command given from the command line
+    executeCmd(args.operation, url, localPath, upload)
+
+    # Quits when done
+    quitFtp()
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random
+
+BROADCAST = "FFFF"
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        self.role = 'FOLLOWER'
+        self.leader = 'FFFF'
+        self.term = 0
+        self.timeout = self.randomTimeout()
+        self.heartbeatAmt = 0.2
+        # self.heartbeatAmt = 0.35
+        self.lastSentHB = 0
+        self.lastHeard = time.time()
+
+        self.inBuffer = []
+        self.outBuffer = []
+        self.myVotes = []
+        self.database = {}
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    def send(self, message):
+        sent = self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+        print("Sent message '%s'" % (message,), flush=True)
+        return sent > 0
+
+    def randomTimeout(self):
+        return round(random.uniform(0.35, 0.55), 3)
+        # return round(random.uniform(0.5, 0.7), 3)
+
+    def prepMsg(self, dst, mType, mid=None):
+        msg = {}
+        msg['src'] = self.id
+        msg['dst'] = dst
+        msg['leader'] = self.leader
+        msg['type'] = mType
+
+        if mid:
+            msg['MID'] = mid
+        return msg
+
+    def createEntry(self, key, val):
+        entry = {
+            'term': self.term,
+            'leader': self.leader,
+            'key': key,
+            'val': val
+        }
+        return entry
+
+    def sendFail(self, dst, MID):
+        fail = self.prepMsg(dst, 'fail', MID)
+        self.outBuffer.append(fail)
+
+    def sendOk(self, dst, MID, payload=False, value=""):
+        ok = self.prepMsg(dst, 'ok', MID)
+
+        if payload:
+            ok['value'] = value
+
+        self.outBuffer.append(ok)
+
+    def readAll(self):
+        socks = select.select([self.socket], [], [], 0.000001)[0]
+
+        for conn in socks:
+            data, addr = conn.recvfrom(65535)
+        
+            if data == None or len(data) == 0:
+                return
+            
+            msg = data.decode('utf-8')
+            msg = json.loads(msg)
+
+            self.inBuffer.append(msg)
+            print("Received message '%s'" % (msg,), flush=True)
+
+    def handleBufferedIn(self):
+        for msg in self.inBuffer:
+            if self.role == 'LEADER':
+                self.rcvLeader(msg)
+            elif self.role == 'CANDIDATE':
+                self.rcvCandidate(msg)
+            elif self.role == 'FOLLOWER':
+                self.rcvFollower(msg)
+
+    def rcvLeader(self, msg):
+        mType = msg['type'] 
+
+        if mType == 'get':
+            key = msg['key']
+            if key in self.database:
+                val = self.database[key]
+                self.sendOk(msg['src'], msg['MID'], True, val)
+            else:
+                self.sendOk(msg['src'], msg['MID'], True)
+
+        elif mType == 'put':
+            key = msg['key']
+            value = msg['value']
+            try:
+                self.database[key] = value # Sets value in database
+                self.sendOk(msg['src'], msg['MID'])
+            except:
+                self.inBuffer.remove(msg)
+                self.sendFail()
+                return
+
+            #TODO UPGRADE IN LATER VERSIONS
+            entries = []
+            entry = self.createEntry(key, value)
+            entries.append(entry)
+
+            notify = self.prepMsg(BROADCAST, 'appendentry')
+            notify['log'] = entries
+            self.outBuffer.append(notify)
+
+        self.inBuffer.remove(msg) # Remove processed message from buffer
+        return
+
+    def rcvCandidate(self, msg):
+        mType = msg['type'] 
+
+        if mType == 'get' or mType == 'put':
+            return
+        elif mType == 'vote_req':
+            if self.term < msg['term']:
+                # TODO: Become follower (someone sent a request w/ higher term)
+                self.becomeFollower()
+                a = ''
+            else:
+                # No vote
+                noVote = self.prepMsg(msg['src'], 'vote')
+                noVote['result'] = 'NO'
+                noVote['term'] = self.term
+                self.outBuffer.append(noVote)
+        elif mType == 'vote':
+            print(self.term, msg, flush=True)
+            if self.term < msg['term']:
+                # TODO: Become follower (someone sent a vote w/ higher term)
+                self.becomeFollower()
+                a = ''
+            if int(msg['term'])+1 == self.term and msg['result'] == 'YES':
+                print('I got a vote...its \#', len(self.myVotes), flush=True)
+                self.myVotes.append(msg['src'])
+
+                if len(self.myVotes) > len(self.others) / 2: # Enough votes!!
+                    self.becomeLeader()
+                    
+                    
+
+        self.inBuffer.remove(msg) # Remove processed message from buffer
+        return
+
+    def rcvFollower(self, msg):
+        mType = msg['type'] 
+
+        if mType == 'get' or mType == 'put':
+            redirect = self.prepMsg(msg['src'], 'redirect', msg['MID'])
+            self.outBuffer.append(redirect)
+        elif mType == 'vote_req':
+            # Add in checks later but for now first come first serve
+            vote = self.prepMsg(msg['src'], 'vote')
+            vote['term'] = self.term
+            vote['result'] = 'YES'
+            self.outBuffer.append(vote)
+        elif mType == 'appendentry':
+            self.lastHeard = time.time()
+
+            mleader = msg['leader']
+            self.leader = mleader if mleader != self.leader else self.leader
+
+            # Update data heard from leader
+            entries = msg['log']
+            if len(entries) > 0: # Updates...
+                for entry in entries:
+                    key = entry['key']
+                    val = entry['val']
+                    self.database[key] = val
+
+        self.inBuffer.remove(msg) # Remove processed message from buffer
+        return
+
+    def becomeLeader(self):
+        print('I WAS ELECTED!!!', flush=True)
+        self.role = 'LEADER'
+        self.leader = self.id
+        self.lastHeard = time.time()
+        self.sendHeartBeat()
+
+    def becomeFollower(self):
+        self.role = 'FOLLOWER'
+        return
+
+    def handleBufferedOut(self):
+        for msg in self.outBuffer:
+            if not self.send(msg):
+                raise Exception('Error sending message...should we crash here?')
+            self.outBuffer.remove(msg)
+
+    def sendHeartBeat(self):
+        hb = self.prepMsg(BROADCAST, 'appendentry')
+
+        if self.role == 'LEADER':
+            hb['log'] = []
+            self.outBuffer.append(hb)
+            return
+        elif self.role == 'CANDIDATE':
+            return
+
+    def liveHeartbeat(self):
+        curr = time.time()
+
+        if (curr - self.lastSentHB) >= self.heartbeatAmt:
+            if self.role == 'LEADER':
+                self.sendHeartBeat()
+                self.lastSentHB = curr
+                return
+            elif self.role == 'CANDIDATE':
+                return
+
+    def startElection(self):
+        print('Election started...', flush=True)
+        self.role = 'CANDIDATE'
+        self.term += 1
+        self.lastHeard = time.time()
+        self.timeout = self.randomTimeout()
+
+        self.myVotes = []
+        self.myVotes.append(self.id) # Vote for myself
+
+        # Send votes...no election fraud here
+        voteReq = self.prepMsg(BROADCAST, 'vote_req')
+        voteReq['term'] = self.term
+        self.outBuffer.append(voteReq)
+
+    def run(self):
+        while True:
+            self.liveHeartbeat()
+            self.handleBufferedOut()
+            self.handleBufferedIn()
+            self.readAll()
+
+            if self.role != 'LEADER' and (time.time() - self.lastHeard) >= self.timeout:
+                self.startElection()
+            
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
